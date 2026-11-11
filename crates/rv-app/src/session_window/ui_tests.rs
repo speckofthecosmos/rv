@@ -231,7 +231,9 @@ fn switch_away_and_back(cx: &mut VisualTestContext) {
 fn activation_sends_local_clipboard_once(cx: &mut TestAppContext) {
     let (_view, cx, mut peer) = setup(cx, false);
     commands(&mut peer);
-    cx.write_to_clipboard(gpui::ClipboardItem::new_string("https://example.test/a".into()));
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+        "https://example.test/a".into(),
+    ));
     switch_away_and_back(cx);
     assert_eq!(copied_texts(&mut peer), ["https://example.test/a"]);
     // Unchanged clipboard: switching again sends nothing.
@@ -250,7 +252,9 @@ fn remote_clipboard_is_not_echoed_back_on_activation(cx: &mut TestAppContext) {
     switch_away_and_back(cx);
     assert!(copied_texts(&mut peer).is_empty());
     assert_eq!(
-        cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
         Some("copied remotely")
     );
 }
