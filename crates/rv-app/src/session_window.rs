@@ -102,6 +102,11 @@ pub struct SessionView {
     pointer_in_window: bool,
     local_cursor: local_cursor::LocalCursor,
     _cursor_subscriptions: Vec<Subscription>,
+    /// Clipboard text both sides already hold: the last text this session
+    /// sent or received. Activating the window sends the local clipboard only
+    /// when it differs, so switching windows never echoes a copy back.
+    clipboard_synced: Option<String>,
+    window_active: bool,
 }
 
 impl SessionView {
@@ -130,7 +135,9 @@ impl SessionView {
             cx.observe_window_activation(window, Self::update_local_cursor),
             cx.on_focus(&focus, window, Self::update_local_cursor),
             cx.on_blur(&focus, window, Self::update_local_cursor),
+            cx.observe_window_activation(window, Self::sync_clipboard_on_activation),
         ];
+        let window_active = window.is_window_active();
         let SessionOptions {
             scale,
             pin_toolbar,
@@ -178,7 +185,38 @@ impl SessionView {
             pointer_in_window: true,
             local_cursor: local_cursor::LocalCursor::default(),
             _cursor_subscriptions: cursor_subscriptions,
+            clipboard_synced: None,
+            window_active,
         }
+    }
+
+    /// Bringing a session window forward hands it the Mac clipboard, the way
+    /// other VNC viewers do, so copying in one session and pasting in another
+    /// needs no button press.
+    fn sync_clipboard_on_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_active = window.is_window_active();
+        if self.window_active {
+            self.push_clipboard_if_changed(cx);
+        }
+    }
+
+    fn push_clipboard_if_changed(&mut self, cx: &App) {
+        if self.view_only() || self.phase != Phase::Connected {
+            return;
+        }
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        if self.clipboard_synced.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        if text.chars().any(|c| c as u32 > 255) {
+            // RFB carries Latin-1 only; the Send clipboard button explains why.
+            return;
+        }
+        self.clipboard_synced = Some(text.clone());
+        self.handle.copy_text(text);
+        self.status = "Clipboard sent".into();
     }
 
     fn update_local_cursor(&mut self, window: &mut Window, _: &mut Context<Self>) {
@@ -221,9 +259,13 @@ impl SessionView {
                     self.phase = Phase::Connected;
                     self.status = format!("{width}×{height}").into();
                     self.error = None;
+                    if self.window_active {
+                        self.push_clipboard_if_changed(cx);
+                    }
                 }
                 SessionEvent::FrameReady { generation } => frame = Some(generation),
                 SessionEvent::Clipboard(text) => {
+                    self.clipboard_synced = Some(text.clone());
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                     self.status = "Clipboard received".into();
                 }
@@ -392,6 +434,7 @@ impl SessionView {
                 self.status = "Clipboard not sent: RFB carries Latin-1 text only".into();
                 return;
             }
+            self.clipboard_synced = Some(text.clone());
             self.handle.copy_text(text);
             self.status = "Clipboard sent".into();
         }

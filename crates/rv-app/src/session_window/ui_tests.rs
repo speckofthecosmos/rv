@@ -210,3 +210,64 @@ fn offscreen_keyboard_forwards_pairs_and_consumes_menu_shortcuts(cx: &mut TestAp
     assert_eq!(keys, [(u32::from(b'a'), true), (u32::from(b'a'), false)]);
     view.read_with(cx, |view, _| assert!(!view.show_menu));
 }
+
+fn copied_texts(peer: &mut SessionTestPeer) -> Vec<String> {
+    commands(peer)
+        .into_iter()
+        .filter_map(|command| match command {
+            SessionCommand::Input(vnc::X11Event::CopyText(text)) => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+fn switch_away_and_back(cx: &mut VisualTestContext) {
+    cx.deactivate_window();
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn activation_sends_local_clipboard_once(cx: &mut TestAppContext) {
+    let (_view, cx, mut peer) = setup(cx, false);
+    commands(&mut peer);
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("https://example.test/a".into()));
+    switch_away_and_back(cx);
+    assert_eq!(copied_texts(&mut peer), ["https://example.test/a"]);
+    // Unchanged clipboard: switching again sends nothing.
+    switch_away_and_back(cx);
+    assert!(copied_texts(&mut peer).is_empty());
+}
+
+#[gpui::test]
+fn remote_clipboard_is_not_echoed_back_on_activation(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup(cx, false);
+    commands(&mut peer);
+    peer.events
+        .send(SessionEvent::Clipboard("copied remotely".into()))
+        .unwrap();
+    view.update(cx, |view, cx| view.pump(cx));
+    switch_away_and_back(cx);
+    assert!(copied_texts(&mut peer).is_empty());
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+        Some("copied remotely")
+    );
+}
+
+#[gpui::test]
+fn activation_skips_view_only_sessions(cx: &mut TestAppContext) {
+    let (_view, cx, mut peer) = setup(cx, true);
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("view only".into()));
+    switch_away_and_back(cx);
+    assert!(copied_texts(&mut peer).is_empty());
+}
+
+#[gpui::test]
+fn activation_skips_clipboard_rfb_cannot_carry(cx: &mut TestAppContext) {
+    let (_view, cx, mut peer) = setup(cx, false);
+    commands(&mut peer);
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("emoji 🙂".into()));
+    switch_away_and_back(cx);
+    assert!(copied_texts(&mut peer).is_empty());
+}
