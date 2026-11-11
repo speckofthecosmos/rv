@@ -20,6 +20,10 @@ pub enum StoreError {
     Keyring(String),
     #[error("Keychain authentication was cancelled")]
     AuthenticationCancelled,
+    /// The Touch ID (Data Protection) Keychain refused this build: it is not
+    /// signed with RV's Keychain provisioning profile.
+    #[error("Touch ID requires a signed RV app with its Keychain provisioning profile")]
+    ProtectedKeychainUnavailable,
     #[error("unknown connection")]
     UnknownConnection,
 }

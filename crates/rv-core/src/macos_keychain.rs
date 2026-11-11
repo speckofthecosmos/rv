@@ -72,9 +72,7 @@ impl PasswordStore for KeychainEntry {
 fn keychain_error(error: security_framework::base::Error) -> StoreError {
     match error.code() {
         USER_CANCELLED => StoreError::AuthenticationCancelled,
-        MISSING_ENTITLEMENT => StoreError::Keyring(
-            "Touch ID requires a signed RV app with its Keychain provisioning profile".into(),
-        ),
+        MISSING_ENTITLEMENT => StoreError::ProtectedKeychainUnavailable,
         _ => StoreError::Keyring(error.to_string()),
     }
 }
@@ -148,26 +146,62 @@ fn stores(id: ConnectionId) -> (KeychainEntry, LegacyEntry) {
     )
 }
 
+// A build without RV's Keychain provisioning profile (any self-built or
+// ad-hoc signed app) cannot reach the Data Protection Keychain at all. Such a
+// build keeps passwords in the login Keychain instead, where the item is
+// limited to the app that created it; a properly signed build behaves exactly
+// as before. Only a missing entitlement falls back: a cancelled or denied
+// Touch ID prompt never does.
 fn load_from(
     protected: &impl PasswordStore,
     legacy: &impl PasswordStore,
 ) -> Result<Option<String>, StoreError> {
     // A denied/cancelled protected read must never fall back to the old entry.
-    let password = match protected.load()? {
-        Some(password) => password,
-        None => {
+    let password = match protected.load() {
+        Ok(Some(password)) => password,
+        Ok(None) => {
             let Some(password) = legacy.load()? else {
                 return Ok(None);
             };
             // Preserve the original until the protected write has succeeded.
-            protected.save(&password)?;
-            password
+            match protected.save(&password) {
+                Ok(()) => password,
+                Err(StoreError::ProtectedKeychainUnavailable) => return Ok(Some(password)),
+                Err(error) => return Err(error),
+            }
         }
+        Err(StoreError::ProtectedKeychainUnavailable) => return legacy.load(),
+        Err(error) => return Err(error),
     };
     // Retry cleanup if a previous migration wrote the protected copy but could
     // not remove the legacy item. Never silently leave an unprotected duplicate.
     legacy.delete()?;
     Ok(Some(password))
+}
+
+fn save_to(
+    protected: &impl PasswordStore,
+    legacy: &impl PasswordStore,
+    password: &str,
+) -> Result<(), StoreError> {
+    match protected.save(password) {
+        Ok(()) => legacy.delete(),
+        Err(StoreError::ProtectedKeychainUnavailable) => legacy.save(password),
+        Err(error) => Err(error),
+    }
+}
+
+fn delete_from(
+    protected: &impl PasswordStore,
+    legacy: &impl PasswordStore,
+) -> Result<(), StoreError> {
+    // Attempt both stores even if one is unavailable.
+    let protected_result = match protected.delete() {
+        Err(StoreError::ProtectedKeychainUnavailable) => Ok(()),
+        result => result,
+    };
+    let legacy_result = legacy.delete();
+    protected_result.and(legacy_result)
 }
 
 pub fn load_password(id: ConnectionId) -> Result<Option<String>, StoreError> {
@@ -177,16 +211,12 @@ pub fn load_password(id: ConnectionId) -> Result<Option<String>, StoreError> {
 
 pub fn save_password(id: ConnectionId, password: &str) -> Result<(), StoreError> {
     let (protected, legacy) = stores(id);
-    protected.save(password)?;
-    legacy.delete()
+    save_to(&protected, &legacy, password)
 }
 
 pub fn delete_password(id: ConnectionId) -> Result<(), StoreError> {
     let (protected, legacy) = stores(id);
-    // Attempt both stores even if one is unavailable.
-    let protected_result = protected.delete();
-    let legacy_result = legacy.delete();
-    protected_result.and(legacy_result)
+    delete_from(&protected, &legacy)
 }
 
 #[cfg(test)]
@@ -200,12 +230,27 @@ mod tests {
         deny_read: Cell<bool>,
         deny_write: Cell<bool>,
         deny_delete: Cell<bool>,
+        /// Every call fails the way an unsigned build's protected Keychain does.
+        unavailable: Cell<bool>,
+        /// Reads succeed but writes are refused for a missing entitlement.
+        unavailable_write: Cell<bool>,
         reads: Cell<usize>,
+    }
+
+    impl FakeStore {
+        fn unsigned() -> Self {
+            let store = Self::default();
+            store.unavailable.set(true);
+            store
+        }
     }
 
     impl PasswordStore for FakeStore {
         fn load(&self) -> Result<Option<String>, StoreError> {
             self.reads.set(self.reads.get() + 1);
+            if self.unavailable.get() {
+                return Err(StoreError::ProtectedKeychainUnavailable);
+            }
             if self.deny_read.get() {
                 return Err(StoreError::AuthenticationCancelled);
             }
@@ -213,6 +258,9 @@ mod tests {
         }
 
         fn save(&self, password: &str) -> Result<(), StoreError> {
+            if self.unavailable.get() || self.unavailable_write.get() {
+                return Err(StoreError::ProtectedKeychainUnavailable);
+            }
             if self.deny_write.get() {
                 return Err(StoreError::Keyring("write failed".into()));
             }
@@ -221,12 +269,81 @@ mod tests {
         }
 
         fn delete(&self) -> Result<(), StoreError> {
+            if self.unavailable.get() {
+                return Err(StoreError::ProtectedKeychainUnavailable);
+            }
             if self.deny_delete.get() {
                 return Err(StoreError::AuthenticationCancelled);
             }
             self.password.borrow_mut().take();
             Ok(())
         }
+    }
+
+    #[test]
+    fn unsigned_build_saves_reads_and_keeps_the_login_keychain_item() {
+        let protected = FakeStore::unsigned();
+        let legacy = FakeStore::default();
+        save_to(&protected, &legacy, "test credential").unwrap();
+        assert_eq!(legacy.password.borrow().as_deref(), Some("test credential"));
+        for _ in 0..2 {
+            assert_eq!(
+                load_from(&protected, &legacy).unwrap().as_deref(),
+                Some("test credential")
+            );
+        }
+        assert_eq!(legacy.password.borrow().as_deref(), Some("test credential"));
+    }
+
+    #[test]
+    fn unsigned_build_keeps_legacy_when_migration_write_lacks_entitlement() {
+        let protected = FakeStore::default();
+        protected.unavailable_write.set(true);
+        let legacy = FakeStore::default();
+        legacy.save("test credential").unwrap();
+        assert_eq!(
+            load_from(&protected, &legacy).unwrap().as_deref(),
+            Some("test credential")
+        );
+        assert_eq!(legacy.password.borrow().as_deref(), Some("test credential"));
+    }
+
+    #[test]
+    fn unsigned_build_without_a_saved_password_returns_none() {
+        let protected = FakeStore::unsigned();
+        let legacy = FakeStore::default();
+        assert_eq!(load_from(&protected, &legacy).unwrap(), None);
+    }
+
+    #[test]
+    fn unsigned_build_forgets_the_login_keychain_item() {
+        let protected = FakeStore::unsigned();
+        let legacy = FakeStore::default();
+        legacy.save("test credential").unwrap();
+        delete_from(&protected, &legacy).unwrap();
+        assert!(legacy.password.borrow().is_none());
+    }
+
+    #[test]
+    fn signed_build_save_still_clears_the_legacy_copy() {
+        let protected = FakeStore::default();
+        let legacy = FakeStore::default();
+        legacy.save("old test credential").unwrap();
+        save_to(&protected, &legacy, "new test credential").unwrap();
+        assert_eq!(
+            protected.password.borrow().as_deref(),
+            Some("new test credential")
+        );
+        assert!(legacy.password.borrow().is_none());
+    }
+
+    #[test]
+    fn other_protected_save_failures_do_not_fall_back() {
+        let protected = FakeStore::default();
+        protected.deny_write.set(true);
+        let legacy = FakeStore::default();
+        assert!(save_to(&protected, &legacy, "test credential").is_err());
+        assert!(legacy.password.borrow().is_none());
     }
 
     #[test]
