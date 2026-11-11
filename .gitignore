@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Provisioning profiles list device identifiers; keep them out of the repo.
+*.provisionprofile
+*.mobileprovision

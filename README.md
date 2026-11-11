@@ -117,6 +117,16 @@ macOS retains its password fallback for unavailable or locked-out biometrics.
 Cancelling authentication cancels the connection attempt. Editing connection
 settings leaves saved passwords untouched unless a replacement is entered.
 
+A personal build can use Touch ID without a Developer ID certificate: register an
+explicit macOS App ID under your team (the upstream bundle id belongs to another
+team, so pick your own), create a macOS App Development profile for it with your
+Apple Development certificate and your Mac, then run
+`RV_PROVISION_PROFILE=<profile> RV_BUNDLE_ID=<your id> scripts/build-touchid-local.sh`.
+The packager refuses a profile that does not list this Mac or the signing
+certificate. Passwords saved by another team's build sit in that team's access
+group and must be entered again. `spctl` rejects a development-signed app; that
+does not matter for a build made on the Mac that runs it.
+
 For a manual authentication check, run `cargo build -p rv-core --example keychain_roundtrip`,
 package `target/debug/examples/keychain_roundtrip` with the
 same signing arguments, and run that bundle's `Contents/MacOS/rv` executable. The
